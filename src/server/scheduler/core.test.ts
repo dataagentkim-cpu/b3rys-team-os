@@ -13,6 +13,7 @@ import {
   EXEC_ALLOWLIST,
   execScheduledJob,
   ensureDailyTaskReviewJobs,
+  ensureOpsJobs,
   ensureWeeklySelfLearningJobs,
   fromSqliteDate,
   getScheduledJob,
@@ -144,6 +145,28 @@ describe("b3os scheduler core", () => {
     expect(fromSqliteDate(first[1]!.next_run_at).getTime()).toBe(kst(2026, 9, 7, 6, 20).getTime());
     expect(JSON.parse(first[0]!.payload_json)).toEqual({ type: "exec", execKey: "task-review-ping" });
     expect(JSON.parse(first[1]!.payload_json)).toEqual({ type: "exec", execKey: "task-review-summary" });
+  });
+
+  test("ops jobs seed the continuation guard and stay idempotent", () => {
+    const d = db();
+    const first = ensureOpsJobs(d, { from: kst(2026, 9, 4, 7, 0) });
+    const second = ensureOpsJobs(d, { from: kst(2026, 9, 4, 7, 0) });
+    expect(first.map((j) => j.id)).toEqual(["sched_task_continuation_guard"]);
+    // 두 번 돌려도 행이 늘지 않아야 한다 — ensureCronJob 은 시딩이 아니라 조정이다.
+    expect(second.map((j) => j.id)).toEqual(first.map((j) => j.id));
+    expect(d.prepare(`SELECT count(*) AS n FROM scheduled_job WHERE id = ?`).get(first[0]!.id)).toEqual({ n: 1 });
+    // 30분 주기는 scripts/task-continuation-guard.ts 헤더가 선언한 값이다.
+    expect(JSON.parse(first[0]!.schedule_expr!)).toMatchObject({ cron: "*/30 * * * *", holidayPolicy: "run" });
+    expect(JSON.parse(first[0]!.payload_json)).toEqual({ type: "exec", execKey: "task-continuation-guard" });
+    // 실행기 파일이 없는 잡은 행을 만들지 않는다 — 기한마다 실행 불가능한 잡이 깨어나기 때문이다.
+    expect(getScheduledJob(d, "sched_workloop_kanban")).toBeNull();
+  });
+
+  test("ops jobs honour the desired toggle", () => {
+    const d = db();
+    d.prepare("INSERT INTO setting (key, value) VALUES ('ops_desired_continuation-guard', 'false')").run();
+    expect(ensureOpsJobs(d, { from: kst(2026, 9, 4, 7, 0) })).toEqual([]);
+    expect(getScheduledJob(d, "sched_task_continuation_guard")).toBeNull();
   });
 
   test("daily task review skips consecutive KR holidays and the following weekend", () => {

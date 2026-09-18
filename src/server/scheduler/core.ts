@@ -9,6 +9,7 @@ import { appendAudit } from "../db/queries";
 import { ambientAgents } from "../lib/registry";
 import { hasCapability } from "../lib/capabilities";
 import { isTeamOfficialMember } from "../lib/agentMembership";
+import { OPS_CATALOG, getDesired } from "../lib/opsRegistry";
 import { type HolidayPolicy, nextCronRun } from "./cron";
 import { TimezoneCronScheduler } from "./timezoneCronScheduler";
 
@@ -114,6 +115,13 @@ export const WEEKLY_SELF_LEARNING_BODY = [
 
 export const DAILY_TASK_REVIEW_PING_JOB_ID = "sched_task_review_ping";
 export const DAILY_TASK_REVIEW_SUMMARY_JOB_ID = "sched_task_review_summary";
+// 운영 잡 — 실행기는 EXEC_ALLOWLIST 에 있는데 행을 만드는 코드가 없어 설치본에서 누락됐다.
+// sched_task_continuation_guard 는 선언된 값이다 (scripts/task-continuation-guard.ts 헤더).
+export const TASK_CONTINUATION_GUARD_JOB_ID = "sched_task_continuation_guard";
+// ★sched_workloop_kanban 은 선언된 값이 아니라 유도값이다.★ workloop-kanban 은 저장소에서
+// EXEC_ALLOWLIST 한 곳에만 나오고 cron 표현식도 id 상수도 없다. id 는 기존 3건의 명명 규칙
+// (`sched_` + execKey 의 `-`→`_`)을, cron 은 그 라벨 "매일 06:00" 의 직역을 따랐다.
+export const WORKLOOP_KANBAN_JOB_ID = "sched_workloop_kanban";
 const LEGACY_FIXED_OFFSET_TIMEZONES = new Set(["Asia/Seoul", "Asia/Kolkata", "UTC", "Etc/UTC"]);
 
 function isValidIanaTimezone(tz: string): boolean {
@@ -510,6 +518,60 @@ export function ensureDailyTaskReviewJobs(db: Database, opts: { from?: Date } = 
     from: opts.from,
     payload: { type: "exec", execKey: spec.execKey },
   }));
+}
+
+/**
+ * Seed and reconcile the ops jobs whose runners exist but whose rows were never created.
+ *
+ * `workloop-kanban` 과 `task-continuation-guard` 는 EXEC_ALLOWLIST 에 실행기가 있는데
+ * 행을 만드는 코드가 없었다 — 설치·부팅·API 어디에도 없어서 설치본에 그냥 빠져 있었다.
+ * 스케줄 값은 선언된 것을 따른다: 30분 주기는 scripts/task-continuation-guard.ts 헤더,
+ * 06:00 은 EXEC_ALLOWLIST 라벨이다. timezone·holidayPolicy 는 적지 않는다 —
+ * ensureCronJob 의 기본값(Asia/Seoul · run)이 그 선언이다.
+ *
+ * 올리지 않는 두 경우:
+ *   1. desired 토글이 꺼진 잡. eligible(조건 predicate)은 보지 않는다 — 그쪽은
+ *      OpsContext(platform·agents·config)를 부팅 시점에 조립해야 해서 범위가 커진다.
+ *   2. ★실행기 파일이 없는 잡★ — allowlist 에 항목이 있어도 스크립트가 없으면 행을 만들지 않는다.
+ *      만들면 기한마다 실행 불가능한 잡이 깨어나고, 그 잡이 깨우는 대상까지 함께 깨어난다.
+ *      판정은 isExecSpecAvailable 을 그대로 쓴다(공개 릴리즈가 scripts/ 를 제외해 생긴 기존 검사다).
+ *      실측 2026-09-18: scripts/workloop-driver.ts 가 저장소에 없다 → workloop-kanban 은 보류된다.
+ *      파일이 생기면 다음 부팅에 자동으로 올라간다.
+ */
+export function ensureOpsJobs(db: Database, opts: { from?: Date } = {}): ScheduledJobRow[] {
+  const specs = [
+    {
+      id: WORKLOOP_KANBAN_JOB_ID,
+      opsId: "kanban-daily",
+      title: "칸반 PM 워크루프 (매일 06:00)",
+      cron: "0 6 * * *",
+      execKey: "workloop-kanban",
+    },
+    {
+      id: TASK_CONTINUATION_GUARD_JOB_ID,
+      opsId: "continuation-guard",
+      title: "진행 지속 가드 (30분 주기)",
+      cron: "*/30 * * * *",
+      execKey: "task-continuation-guard",
+    },
+  ] as const;
+
+  const seeded: ScheduledJobRow[] = [];
+  for (const spec of specs) {
+    const entry = OPS_CATALOG.find((e) => e.id === spec.opsId);
+    if (entry && !getDesired(db, entry)) continue;
+    const execSpec = resolveExecSpec(EXEC_ALLOWLIST, spec.execKey);
+    if (!execSpec || !isExecSpecAvailable(execSpec)) continue;
+    seeded.push(ensureCronJob(db, {
+      id: spec.id,
+      title: spec.title,
+      cron: spec.cron,
+      createdBy: "system",
+      from: opts.from,
+      payload: { type: "exec", execKey: spec.execKey },
+    }));
+  }
+  return seeded;
 }
 
 export function getScheduledJob(db: Database, id: string): ScheduledJobRow | null {

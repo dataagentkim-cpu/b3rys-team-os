@@ -51,7 +51,7 @@ import { createSettingsApp, PUBLIC_BUILD } from "./routes/settings";
 import { createAcceptanceRoutes } from "./routes/acceptance";
 import { createSchedulerRoutes } from "./routes/scheduler";
 import { createCiStatusRoutes } from "./routes/ciStatus";
-import { ensureDailyTaskReviewJobs, ensureWeeklySelfLearningJobs } from "./scheduler/core";
+import { ensureDailyTaskReviewJobs, ensureOpsJobs, ensureWeeklySelfLearningJobs } from "./scheduler/core";
 import { renderAndRepoint } from "./lib/teamOsRender";
 import { installProgressHook, repairProgressHook, repairReplyGuardHook, ensureOwnerGateHook } from "./runtimes/claude/launcher";
 import { writeMemberPersona, savePersonaFile } from "./lib/writeMemberPersona";
@@ -93,6 +93,7 @@ const db = openDb(DB_PATH);
 migrate(db);
 ensureWeeklySelfLearningJobs(db);
 ensureDailyTaskReviewJobs(db);
+ensureOpsJobs(db);
 configureLeadActorDb(db);
 initGroupOwnerStore(db); // 그룹 owner DB 영속화: db 핸들 주입 + 저장된 owner 복원(재시작 유지)
 let agents = syncRegistry(db, REGISTRY_PATH);
