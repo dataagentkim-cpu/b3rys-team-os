@@ -157,6 +157,12 @@ describe("b3os scheduler core", () => {
     expect(d.prepare(`SELECT count(*) AS n FROM scheduled_job WHERE id = ?`).get(first[0]!.id)).toEqual({ n: 1 });
     // 30분 주기는 scripts/task-continuation-guard.ts 헤더가 선언한 값이다.
     expect(JSON.parse(first[0]!.schedule_expr!)).toMatchObject({ cron: "*/30 * * * *", holidayPolicy: "run" });
+    // timezone 은 ensureOpsJobs 가 고르지 않고 ensureCronJob 의 기본값을 받는다. 그 기본값이
+    // 바뀌면 이 잡의 실행 시각이 말없이 옮겨가므로 여기서 같이 고정한다.
+    expect(first[0]!.timezone).toBe("Asia/Seoul");
+    // 두 번째 호출은 생성이 아니라 조정 경로를 탄다. 그쪽 기본값이 어긋나면 행이 조용히
+    // UPDATE 되므로, 재호출 뒤의 값도 같이 본다.
+    expect(second[0]!.timezone).toBe("Asia/Seoul");
     expect(JSON.parse(first[0]!.payload_json)).toEqual({ type: "exec", execKey: "task-continuation-guard" });
     // 실행기 파일이 없는 잡은 행을 만들지 않는다 — 기한마다 실행 불가능한 잡이 깨어나기 때문이다.
     expect(getScheduledJob(d, "sched_workloop_kanban")).toBeNull();
