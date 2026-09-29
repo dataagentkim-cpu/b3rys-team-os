@@ -197,6 +197,33 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   fi
 fi
 
+# ─── 세션 수 상한 ─────────────────────────────────────────────────────────
+# 여기까지 왔다는 것은 ★세션이 하나 늘어난다★ 는 뜻이다. 위의 has-session 분기에서
+#   - 이미 있고 --force 아님  → exit 0 (수가 안 는다)
+#   - 이미 있고 --force       → kill 후 재생성 (수가 안 는다)
+# 이 둘은 이미 빠져나갔다. 그래서 상한은 기동 진입부가 아니라 이 지점에서 본다.
+# 진입부에서 보면 재기동·복구까지 상한에 걸려 막힌다.
+#
+# 넘었을 때 ★죽이지 않는다★ — 실행 중 세션은 진행 중 작업을 들고 있고, 그것을 잃는
+# 비용이 메모리보다 크다. 새로 띄우는 것만 멈추고 사실을 출력한다.
+#
+# 임계값과 세는 법은 한 파일에만 둔다(B3OS_CAPACITY_LIB). 두 곳에 복사하면 한쪽만
+# 고쳐져 갈라진다. 그 파일이 없는 설치에서는 게이트를 걸지 않고, 걸지 않았다는 것을
+# 출력한다 — 조용히 통과하면 상한이 있다고 오해한다.
+CAPACITY_LIB="${B3OS_CAPACITY_LIB:-$HOME/b3os/ops/lib/capacity-check.sh}"
+if [[ -r "$CAPACITY_LIB" ]]; then
+  # shellcheck source=/dev/null
+  source "$CAPACITY_LIB"
+  if ! b3os_session_slot_available; then
+    echo "ERROR: 멤버 세션이 상한입니다 — $(b3os_member_sessions)/$B3OS_MAX_MEMBER_SESSIONS. '$SESSION_NAME' 을 띄우지 않습니다." >&2
+    echo "  실행 중인 세션은 그대로 둡니다. 끝난 세션을 닫거나 B3OS_MAX_MEMBER_SESSIONS 를 올리십시오." >&2
+    b3os_capacity_report >&2
+    exit 3
+  fi
+else
+  echo "NOTE: 용량 상한 파일이 없어 세션 수를 검사하지 않았습니다 ($CAPACITY_LIB)." >&2
+fi
+
 # ─── Spawn ────────────────────────────────────────────────────────────────
 
 # 권한 모드 — 봇 tmux 세션엔 사람이 붙어있지 않아 권한 프롬프트에 답할 수 없다.
