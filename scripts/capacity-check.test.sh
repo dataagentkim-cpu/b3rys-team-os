@@ -92,11 +92,37 @@ echo "2999 1001 bun" >> "$PSF"     # claude-m1 pane 밑에 붙은 여분 bun
 read -r x a e <<<"$(measure)"
 [ "$x" = "1" ] && ok "초과분 1 (실제 $a / 기대 $e)" || bad "누수를 잡아야 한다" "초과분=$x (실제 $a / 기대 $e)"
 
-echo "── 5. MCP bun 밑에 붙은 여분도 잡는다 (2단까지 센다) ──"
+echo "── 5. MCP bun 밑에 붙은 여분을 잡는다 ──"
 base_sessions; base_ps
 echo "3999 2001 bun" >> "$PSF"     # MCP bun 밑에 붙은 여분 bun
 read -r x a e <<<"$(measure)"
-[ "$x" = "1" ] && ok "초과분 1 — 2단도 센다" || bad "2단을 세야 한다" "초과분=$x (실제 $a / 기대 $e)"
+[ "$x" = "1" ] && ok "초과분 1 — 사슬 위쪽 bun 도 센다" || bad "bun 사슬을 따라가야 한다" "초과분=$x (실제 $a / 기대 $e)"
+
+echo "── 5b. ★3단 손자 bun(진짜 누수)도 잡는다 — 단 수를 세지 않는다★ ──"
+# 2단까지만 세던 판에서는 이게 초과분 0 으로 나와 완전히 안 보였다.
+base_sessions; base_ps
+echo "4999 3001 bun" >> "$PSF"     # MCP 2단 bun 밑에 또 bun
+read -r x a e <<<"$(measure)"
+[ "$x" = "1" ] && ok "초과분 1 (실제 $a / 기대 $e)" || bad "3단 누수를 잡아야 한다" "초과분=$x (실제 $a / 기대 $e)"
+
+echo "── 7. ★모양이 바뀌어 하나도 못 세면 ⚠ 로 알린다 (조용히 침묵하지 않는다)★ ──"
+# pane → zsh → bun → bun : MCP 기동 사이에 프로세스가 끼면 이 카운터는 0 을 센다.
+# 초과분이 음수가 되는데 ⚠ 는 양수에서만 나므로, 그냥 두면 "누수 0" 과 구분이 안 된다.
+: > "$PSF"
+for i in 1 2 3; do
+  echo "100$i 1 /Users/x/.local/bin/claude" >> "$PSF"
+  echo "150$i 100$i /bin/zsh"               >> "$PSF"   # 사이에 낀 프로세스
+  echo "200$i 150$i bun"                    >> "$PSF"
+  echo "300$i 200$i /private/tmp/bun"       >> "$PSF"
+done
+base_sessions
+rep=$(b3os_capacity_report)
+echo "$rep" | grep -q "하나도 못 셌다" && ok "⚠ 가 나온다" || bad "⚠ 로 알려야 한다" "$(echo "$rep" | tr '\n' ' ')"
+echo "$rep" | grep -q "멤버 세션이 낳은 bun 0 " && ok "숫자도 0 으로 보인다" || bad "실제값이 0 이어야 한다" "$(echo "$rep" | tr '\n' ' ')"
+
+echo "── 7b. 정상일 때는 그 ⚠ 가 나오지 않는다 ──"
+base_sessions; base_ps
+b3os_capacity_report | grep -q "하나도 못 셌다" && bad "정상인데 ⚠ 가 나온다" "$(b3os_capacity_report | tr '\n' ' ')" || ok "⚠ 없음"
 
 echo "── 6. 세션이 하나도 없으면 0 (음수·오류 없음) ──"
 : > "$SESS"; base_ps

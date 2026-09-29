@@ -75,14 +75,18 @@ b3os_orphan_claude_pids() {
 #   ★정상 작업을 보고 우는 경고는 반복되면 아무도 보지 않고, 그러면 진짜 누수가 묻힌다.★
 #
 # 실측한 모양으로 가른다:
-#   MCP  : claude(pane) → bun → bun      — 사이에 셸이 없다
-#   애드혹: claude(pane) → zsh → bun      — 셸을 거친다
-# 그래서 ★부모가 pane 인 bun(1단), 그리고 그 bun 의 자식 bun(2단)★ 만 센다.
-# 세션이 bun 을 더 달면 1단·2단 어느 쪽이든 수가 늘어 초과분으로 나온다.
+#   MCP  : claude(pane) → bun → bun      — 사이가 전부 bun 이다
+#   애드혹: claude(pane) → zsh → bun      — 셸이 낀다
+# 그래서 ★bun 에서 부모를 따라 올라가며, 중간이 전부 bun 이고 pane 에서 멈추면★ 센다.
+#   단 수를 세지 않는다 — "2단까지" 로 적으면 3단 누수가 안 보이고, 그 한 줄을 더하면
+#   같은 문제가 4단으로 미뤄질 뿐이다. 실제로 쓰는 기준은 단 수가 아니라 ★사슬에 셸이
+#   끼지 않았는가★ 이므로 그것을 그대로 적는다. 셸 목록을 열거할 필요도 없다 —
+#   ★bun 이 아니면 탈락★ 이라 무엇이 끼든 같게 처리된다.
 #
-# ★이 규칙은 위 모양에 묶여 있다.★ MCP 기동 방식이 바뀌어 사이에 다른 프로세스가 끼면
-#   이 카운터는 0 을 센다 — 없는 것을 있다고 하지는 않지만, 있는 누수를 놓치는 쪽으로
-#   틀린다. 모양이 바뀌면 여기를 같이 고쳐야 한다.
+# ★이 규칙은 위 모양에 묶여 있다.★ MCP 기동 방식이 바뀌어 사이에 bun 아닌 프로세스가
+#   끼면 이 카운터는 0 을 센다 — 없는 것을 있다고 하지는 않지만, 있는 누수를 놓치는
+#   쪽으로 틀린다. ★그 상태를 보고에서 ⚠ 로 알린다★(아래 b3os_capacity_report).
+#   주석은 5분마다 읽히지 않는다.
 b3os_member_bun_pids() {
   local panes
   panes=$(b3os_pane_pids)
@@ -92,10 +96,15 @@ b3os_member_bun_pids() {
     !sep { pane[$1] = 1; next }
     { ppid[$1] = $2; isbun[$1] = ($3 ~ /\/bun$|^bun$/) }
     END {
-      for (p in ppid) if (isbun[p] && (ppid[p] in pane)) lvl1[p] = 1
-      for (p in ppid) if (isbun[p] && (ppid[p] in lvl1)) lvl2[p] = 1
-      for (p in lvl1) print p
-      for (p in lvl2) print p
+      for (p in ppid) {
+        if (!isbun[p]) continue
+        c = ppid[p]; d = 0
+        while (c != "" && d < 32) {
+          if (c in pane) { print p; break }
+          if (!isbun[c]) break     # bun 아닌 것이 끼면 우리 것이 아니다
+          c = ppid[c]; d++
+        }
+      }
     }'
 }
 
@@ -114,16 +123,22 @@ b3os_capacity_report() {
     echo "용량을 셀 수 없습니다 — tmux 를 찾지 못했습니다($TMUX_BIN)"
     return 0
   fi
-  local s o b
+  local s o a e b
   s=$(b3os_member_sessions)
   o=$(b3os_orphan_claude_pids | grep -c . || true)
-  b=$(b3os_bun_excess)
+  a=$(b3os_bun_actual)
+  e=$(b3os_bun_expected)
+  b=$(( a - e ))
   echo "멤버 세션 $s / 상한 $B3OS_MAX_MEMBER_SESSIONS"
   echo "고아 claude $o (상한 0)"
-  echo "멤버 bun 초과분 $b (상한 0) — 멤버 세션이 낳은 bun $(b3os_bun_actual) / 기대 $(b3os_bun_expected)"
+  echo "멤버 bun 초과분 $b (상한 0) — 멤버 세션이 낳은 bun $a / 기대 $e"
   [ "$s" -ge "$B3OS_MAX_MEMBER_SESSIONS" ] && echo "⚠ 세션 상한"
   [ "$o" -gt 0 ] && echo "⚠ 고아 claude $o 개: $(b3os_orphan_claude_pids | tr '\n' ' ')"
   [ "$b" -gt 0 ] && echo "⚠ 멤버 bun 초과분 $b 개"
+  # ★카운터가 고장난 것과 "누수 0" 은 다르다.★ 세션이 있는데 멤버 bun 을 하나도 못 셌으면
+  #   MCP 기동 모양이 바뀐 것이다. 이때 초과분은 음수가 되는데, ⚠ 는 양수에서만 나므로
+  #   그냥 두면 ★숫자는 비명을 지르는데 경고는 침묵한다★ — 사람이 보는 것은 ⚠ 줄이다.
+  [ "$s" -gt 0 ] && [ "$a" -eq 0 ] && echo "⚠ 멤버 bun 을 하나도 못 셌다 — MCP 프로세스 모양이 바뀌었을 수 있다(이 카운터는 무효)"
   return 0
 }
 
