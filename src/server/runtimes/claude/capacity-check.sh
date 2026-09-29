@@ -43,6 +43,13 @@ b3os_capacity_usable() { [ -x "$TMUX_BIN" ] || command -v "$TMUX_BIN" >/dev/null
 #   "그 세션에서 파생된 것만" 센다.
 b3os_member_sessions() { "$TMUX_BIN" ls 2>/dev/null | grep -c '^claude-' || true; }
 
+# ps 표(pid ppid comm)를 한 번만 뜬다. bun 마다 ps 를 부르면 느리고, 도는 동안 프로세스가
+# 바뀌어 앞뒤가 안 맞는다. 시험은 B3OS_PS_TABLE_FILE 로 고정된 표를 끼운다.
+b3os_ps_table() {
+  if [ -n "${B3OS_PS_TABLE_FILE:-}" ]; then cat "$B3OS_PS_TABLE_FILE"
+  else ps -Ao pid,ppid,comm; fi
+}
+
 b3os_pane_pids() {
   "$TMUX_BIN" ls -F '#{session_name}' 2>/dev/null | grep '^claude-' | while read -r s; do
     "$TMUX_BIN" list-panes -t "$s" -F '#{pane_pid}' 2>/dev/null
@@ -58,9 +65,42 @@ b3os_orphan_claude_pids() {
   comm -13 <(printf '%s\n' "$panes") <(printf '%s\n' "$all")
 }
 
-# 멤버 세션 1개당 MCP bun 이 2개, 그리고 서버 자신이 2개(bun run start · index.ts).
-b3os_bun_expected() { echo $(( $(b3os_member_sessions) * 2 + 2 )); }
-b3os_bun_actual()   { ps -Ao pid,comm | awk '$2 ~ /\/bun$|^bun$/' | wc -l | tr -d ' '; }
+# 멤버 세션의 MCP bun 만 센다 — 세션 1개당 정확히 2개다.
+#
+# ★머신의 bun 을 전부 세면 안 되고, "pane 의 자손" 으로도 부족하다.★
+#   이전 판은 `전체 bun − (세션수 × 2 + 2)` 였는데, 그 식은 "bun 을 띄우는 것은 멤버
+#   세션과 서버뿐" 을 전제한다. 셸에서 `bun test` 를 돌리기만 해도 초과분으로 잡혔다.
+#   그렇다고 "부모 사슬이 pane 에 닿는 bun" 으로 바꾸면 여전히 잡힌다 — 멤버가 자기
+#   도구로 띄운 셸도 그 pane 의 자손이라, 거기서 돌린 `bun test` 가 같이 걸린다(실측).
+#   ★정상 작업을 보고 우는 경고는 반복되면 아무도 보지 않고, 그러면 진짜 누수가 묻힌다.★
+#
+# 실측한 모양으로 가른다:
+#   MCP  : claude(pane) → bun → bun      — 사이에 셸이 없다
+#   애드혹: claude(pane) → zsh → bun      — 셸을 거친다
+# 그래서 ★부모가 pane 인 bun(1단), 그리고 그 bun 의 자식 bun(2단)★ 만 센다.
+# 세션이 bun 을 더 달면 1단·2단 어느 쪽이든 수가 늘어 초과분으로 나온다.
+#
+# ★이 규칙은 위 모양에 묶여 있다.★ MCP 기동 방식이 바뀌어 사이에 다른 프로세스가 끼면
+#   이 카운터는 0 을 센다 — 없는 것을 있다고 하지는 않지만, 있는 누수를 놓치는 쪽으로
+#   틀린다. 모양이 바뀌면 여기를 같이 고쳐야 한다.
+b3os_member_bun_pids() {
+  local panes
+  panes=$(b3os_pane_pids)
+  [ -n "$panes" ] || return 0
+  { printf '%s\n' "$panes"; echo "--"; b3os_ps_table; } | awk '
+    $1 == "--" { sep = 1; next }
+    !sep { pane[$1] = 1; next }
+    { ppid[$1] = $2; isbun[$1] = ($3 ~ /\/bun$|^bun$/) }
+    END {
+      for (p in ppid) if (isbun[p] && (ppid[p] in pane)) lvl1[p] = 1
+      for (p in ppid) if (isbun[p] && (ppid[p] in lvl1)) lvl2[p] = 1
+      for (p in lvl1) print p
+      for (p in lvl2) print p
+    }'
+}
+
+b3os_bun_expected() { echo $(( $(b3os_member_sessions) * 2 )); }
+b3os_bun_actual()   { b3os_member_bun_pids | grep -c . || true; }
 b3os_bun_excess()   { echo $(( $(b3os_bun_actual) - $(b3os_bun_expected) )); }
 
 # 세션을 하나 더 띄워도 되는가. ★이미 있는 세션의 재시작에는 쓰지 않는다★ — 수가 안 는다.
@@ -80,10 +120,10 @@ b3os_capacity_report() {
   b=$(b3os_bun_excess)
   echo "멤버 세션 $s / 상한 $B3OS_MAX_MEMBER_SESSIONS"
   echo "고아 claude $o (상한 0)"
-  echo "bun 초과분 $b (상한 0) — 실제 $(b3os_bun_actual) / 기대 $(b3os_bun_expected)"
+  echo "멤버 bun 초과분 $b (상한 0) — 멤버 세션이 낳은 bun $(b3os_bun_actual) / 기대 $(b3os_bun_expected)"
   [ "$s" -ge "$B3OS_MAX_MEMBER_SESSIONS" ] && echo "⚠ 세션 상한"
   [ "$o" -gt 0 ] && echo "⚠ 고아 claude $o 개: $(b3os_orphan_claude_pids | tr '\n' ' ')"
-  [ "$b" -gt 0 ] && echo "⚠ bun 초과분 $b 개"
+  [ "$b" -gt 0 ] && echo "⚠ 멤버 bun 초과분 $b 개"
   return 0
 }
 
