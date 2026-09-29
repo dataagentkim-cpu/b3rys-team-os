@@ -299,10 +299,46 @@ describe("★전원공지 시간당 상한★", () => {
     for (let i = 1; i <= 4; i += 1) expect((await blast(h, i)).status).not.toBe(429);
   });
 
-  it("0 이면 전원공지를 전면 차단한다 — off 와 다른 값이다", async () => {
+  // ★상태코드만 보는 시험은 문구가 거짓말하는 것을 못 잡는다.★
+  //   cap=0 은 이력이 0건이라 창의 시작점이 없다 → retry 계산이 0 이 된다.
+  //   그 값을 429 로 실어 보내면 규약상 "지금 바로 재시도하라" 가 되어
+  //   재시도하는 클라이언트를 즉시 재시도 루프에 넣는다. 그래서 본문까지 본다.
+  it("0 이면 전면 차단이다 — 레이트리밋이 아니라 403, retry 값을 싣지 않는다", async () => {
     process.env[ENV_KEY] = "0";
     const { h } = app();
-    expect((await blast(h, 1)).status).toBe(429);
+    const res = await blast(h, 1);
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ error: "all_hands_disabled", cap_per_hour: 0 });
+    // ★기다리면 열린다는 신호를 주지 않는다★ — 기다려도 열리지 않는다.
+    expect(body).not.toHaveProperty("retry_after_sec");
+    expect(body.detail as string).not.toContain("초 뒤");
+    // 대신 지금 쓸 수 있는 경로를 준다.
+    expect(body.detail as string).toContain("--to broadcast");
+  });
+
+  it("0 일 때 차단 사유를 rate_limited 가 아니라 disabled_by_config 로 기록한다", async () => {
+    process.env[ENV_KEY] = "0";
+    const { h, db } = app();
+    await blast(h, 1);
+    const row = db.prepare(
+      `SELECT detail_json FROM audit_event WHERE action='agent_all_hands_blocked' ORDER BY id DESC LIMIT 1`,
+    ).get() as { detail_json: string };
+    const detail = JSON.parse(row.detail_json) as Record<string, unknown>;
+    expect(detail).toMatchObject({ error: "disabled_by_config", cap_per_hour: 0 });
+    expect(detail).not.toHaveProperty("retry_after_sec");
+  });
+
+  it("상한이 양수일 때는 429 이고 retry 값이 실린다 — 그때는 기다리면 실제로 열린다", async () => {
+    process.env[ENV_KEY] = "1";
+    const { h } = app();
+    await blast(h, 1);
+    const res = await blast(h, 2);
+    expect(res.status).toBe(429);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe("all_hands_rate_limited");
+    expect(body.retry_after_sec as number).toBeGreaterThan(0);
+    expect(body.detail as string).toContain("초 뒤");
   });
 });
 

@@ -59,7 +59,7 @@ export function allHandsHourlyCap(
   return n;
 }
 
-/** 한도가 다시 림리는 까지 남은 초. `at` 은 UTC 문자열(`datetime('now')`)이라
+/** 한도가 다시 열리기까지 남은 초. `at` 은 UTC 문자열(`datetime('now')`)이라
  *  ★Z 를 붙여 해석해야 한다★ — 안 붙이면 로컬로 읽혀 KST 에서 9시간 틀린다. */
 export function retryAfterSec(oldestAt: string | null, nowMs: number = Date.now()): number {
   if (!oldestAt) return 0;
@@ -219,14 +219,18 @@ export function createInboxRoutes(deps: InboxRouteDeps): Hono {
           detail: "전체공지는 정식·활성 팀원만 보낼 수 있습니다.",
         }, 403);
       }
-      // ★시간당 상한★ — 자객 검사는 "보낼 수 있는가"만 보고 "얼마나 자주"를 보지 않는다.
-      //   전원공지 1건은 나머지 명부 전원을 깨워 한 턴을 소모시킨다. 상한이 없으면
+      // ★시간당 상한★ — 위 자격 검사는 "보낼 수 있는가"만 보고 "얼마나 자주"는 보지 않는다.
+      //   전원공지 1건은 나머지 명부 전원을 깨워 각자의 턴을 소모시킨다. 상한이 없으면
       //   1인이 짧은 사이에 반복해 명부 전원의 턴을 몇 배로 태울 수 있다.
-      //   실재: 전원공지 2건이 90초 안에 나가 각 6명을 깨웠다(머버 턴 12개).
+      //   실측: 전원공지 2건이 90초 안에 나가 각 6명을 깨웠다(멤버 턴 12개).
       //
-      // 세는 것은 새 상태가 아니라 이미 성공 건마다 단는 기록(`agent_broadcast_all_hands`)이다.
-      //   ★그래서 재시작·배효에도 창이 살아있고★, 마이그레이새이 필요 없다.
-      //   거부된 시도는 기록을 남기지 않으물 — 맞지 않았다면 한도를 소분하지 않는다.
+      // 세는 것은 새 상태가 아니라 이미 성공 건마다 남는 기록(`agent_broadcast_all_hands`)이다.
+      //   ★그래서 재시작·배포에도 60분 창이 유지되고★, 마이그레이션이 필요 없다.
+      //   거부된 시도는 그 기록을 남기지 않으므로 ★한도를 소모하지 않는다★.
+      //
+      // ★이 상한은 `all_hands` 키를 쓰는 경로만 덮는다.★ 팀장 @all 은 이 키를 쓰지 않고
+      //   본문 마커로 판정되는 다른 경로(`broadcastAudience`)이므로 여기 걸리지 않는다 —
+      //   상한의 목적은 1인이 전원의 턴을 태우는 것을 막는 것이고, 그 턴의 주인은 막지 않는다.
       const hourlyCap = allHandsHourlyCap();
       if (hourlyCap !== null) {
         const window = deps.db
@@ -240,11 +244,41 @@ export function createInboxRoutes(deps: InboxRouteDeps): Hono {
           )
           .get(env.from_agent_id, Math.max(hourlyCap, 1)) as { n: number; oldest: string | null };
         if (window.n >= hourlyCap) {
+          // ★cap=0 은 "잠깐 참으라" 가 아니라 "설정으로 아예 닫혔다" 다.★ 기다려도 열리지 않는다.
+          //   그래서 레이트리밋으로 답하지 않는다 — 429 + `retry_after_sec: 0` 은 규약상
+          //   ★"지금 바로 재시도하라"★ 는 뜻이어서, 재시도하는 클라이언트를 즉시 재시도 루프에 넣는다.
+          //   상한을 거는 기능이 상한을 가장 세게 걸었을 때 가장 시끄러워지면 안 된다.
+          //   전면 차단은 시간이 아니라 권한의 문제이므로 403 으로 답하고 retry 값을 아예 싣지 않는다.
+          const alternative =
+            "공지는 --all-hands 없이 --to broadcast 로 보내십시오(방에만 게시되고 아무도 안 깨웁니다). " +
+            "한 사람에게만 필요하면 --to <이름> 을 쓰십시오.";
+
+          if (hourlyCap === 0) {
+            const detail = {
+              reason: env.all_hands,
+              sent_last_hour: window.n,
+              cap_per_hour: 0,
+              error: "disabled_by_config",
+              identity_basis: "claimed_from_agent_id",
+            };
+            appendAudit(deps.db, env.from_agent_id, "agent_all_hands_blocked", null, detail);
+            appendAuditFile(env.from_agent_id, "agent_all_hands_blocked", null, detail);
+            return c.json({
+              error: "all_hands_disabled",
+              detail:
+                "전원공지가 설정으로 전면 차단돼 있습니다(BUS_ALL_HANDS_MAX_PER_HOUR=0). " +
+                `기다려도 열리지 않습니다 — 설정을 바꿔야 합니다. ${alternative}`,
+              cap_per_hour: 0,
+              sent_last_hour: window.n,
+            }, 403);
+          }
+
+          const retryAfter = retryAfterSec(window.oldest);
           const detail = {
             reason: env.all_hands,
             sent_last_hour: window.n,
             cap_per_hour: hourlyCap,
-            retry_after_sec: retryAfterSec(window.oldest),
+            retry_after_sec: retryAfter,
             error: "rate_limited",
             identity_basis: "claimed_from_agent_id",
           };
@@ -253,13 +287,11 @@ export function createInboxRoutes(deps: InboxRouteDeps): Hono {
           return c.json({
             error: "all_hands_rate_limited",
             detail:
-              `전원공지는 시간당 ${hourlyCap}건입니다 — 지난 1시간 ${window.n}건으로 한도가 챠습니다. ` +
-              `${retryAfterSec(window.oldest)}초 뒤 다시 가능합니다. ` +
-              `급하지 않은 공지는 --all-hands 없이 --to broadcast 로 보내십시오(방에만 게시되고 아무도 안 깨웁니다). ` +
-              `한 사람에게만 필요하면 --to <이름> 을 쓰십시오.`,
+              `전원공지는 시간당 ${hourlyCap}건입니다 — 지난 1시간 ${window.n}건으로 한도가 찼습니다. ` +
+              `${retryAfter}초 뒤 다시 가능합니다. 급하지 않으면 그때 보내십시오. ${alternative}`,
             cap_per_hour: hourlyCap,
             sent_last_hour: window.n,
-            retry_after_sec: retryAfterSec(window.oldest),
+            retry_after_sec: retryAfter,
           }, 429);
         }
       }
