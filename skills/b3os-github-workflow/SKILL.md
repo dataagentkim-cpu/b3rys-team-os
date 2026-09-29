@@ -285,6 +285,8 @@ gh pr view <번호> --json state,mergedAt --jq '"\(.state) \(.mergedAt)"'
 git fetch origin && git log origin/main --oneline -1
 ```
 
+조상 검사는 ★"들어갔다"만 증명한다. "안 들어갔다"는 증명하지 못한다.★ squash 머지는 SHA 를 새로 만들기 때문이다. 음성이 나오면 ★내용 대조★(`git diff <브랜치tip> <main커밋>` 이 0줄인지)로 다시 잰다.
+
 머지됐다고 **라이브에 반영된 것은 아니다.** 실행 중인 프로세스는 이미 메모리에 올린 옛 코드로 계속 돈다. 반영이 필요하면 그건 별도 작업이고 **승인 게이트 대상**이다(TEAM-OS §4).
 
 ## ★공개 저장소가 된 뒤 — 달라지는 것★
