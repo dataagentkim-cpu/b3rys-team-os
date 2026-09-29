@@ -249,7 +249,11 @@ export async function restartAgent(agentId: string, runtime: string, fresh = fal
       //   2026-07-30 실측: launchctl kickstart 로 스크립트를 다시 돌렸더니 정확히 이 no-op 에 걸려 리사가 계속 죽어 있었다.
       //   --force 는 스크립트 안에서 kill 후 기동을 보장하므로 kill 성공 여부와 무관하게 복구가 성립한다(멱등).
       const args = fresh ? [agentId, "--force"] : [agentId, "--resume", "--force"];
-      const r = await run(["bash", starter, ...args]);
+      // ★이것이 재시작이라는 사실을 기동 스크립트에 넘긴다.★ 위에서 이미 kill 했으므로
+      //   스크립트가 실행될 때는 세션이 없다 — 스크립트 혼자서는 새 기동과 구분할 수 없다.
+      //   구분하지 못하면 세션 수 상한이 이 경로를 새 세션으로 보고 거부할 수 있고,
+      //   그러면 죽여놓고 못 살린다. 재시작은 수를 늘리지 않으므로 상한을 보지 않는다.
+      const r = await run(["bash", starter, ...args], { B3OS_SESSION_RESTART: "1" });
       if (r.code !== 0) return { ok: false, detail: `재시작 실패: ${r.out.slice(-150)}` };
       return withPollerRecovery(agentId, `claude ${agentId} 재시작(${mode})`);
     }
