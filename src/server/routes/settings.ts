@@ -55,6 +55,7 @@ import { verifyFirstModelCall, type FirstModelCallResult } from "../lib/runtimeS
 import { hasCapability, COORDINATOR_CAPABILITY } from "../lib/capabilities";
 import { hasSlackTokenFile, loadAgentCreds, saveAgentCreds, removeAgentCreds, slackTokensDir, postMessage } from "../lib/slack";
 import { renderAndRepoint, TEAM_OS_TEMPLATE_PATH, LIVE_TEAM_OS_PATH } from "../lib/teamOsRender";
+import { renderSkillsMd } from "../lib/skillsRender";
 import { HERMES_BASE_PROFILE } from "../lib/paths";
 import { isHermesProfileProtected } from "../lib/hermesBaseProfile";
 import { latestCaptureNonBotSender, listDiscoveredGroups } from "../lib/telegramLeadDetection";
@@ -353,6 +354,7 @@ export function createSettingsApp(deps: SettingsDeps): Hono {
       const claudeIds = readAgents().filter((a: any) => a.runtime === "claude_channel").map((a: any) => a.id);
       const v = getSetting(db, "owner_name");
       const r = renderAndRepoint(v, claudeIds);
+      renderSkillsMd();
       appendAudit(db, "user", "teamos_owner_rendered", "team", { owner: r.owner, repointed: r.repointed, ok: r.ok });
     } catch { /* best-effort */ }
   };
@@ -1257,7 +1259,7 @@ export function createSettingsApp(deps: SettingsDeps): Hono {
       try {
         writeFileSync(join(_paths.workspace_path, JOIN_FLAG_FILE), joinInstructions(display_name, role));
       } catch { /* best-effort */ }
-      // claude_channel: CLAUDE.md 의 `@TEAM-OS.md`(상대) 가 풀리도록 workspace 에 심링크 생성(Steve 패턴).
+      // claude_channel: workspace 에 TEAM-OS.md 심링크 생성(Steve 패턴). 2026-09-19 부터 CLAUDE.md 는 @import 하지 않고 이 경로를 "필요할 때 읽는" 용도로 쓴다.
       if (runtime === "claude_channel") {
         const link = join(_paths.workspace_path, "TEAM-OS.md");
         if (!existsSync(link)) {

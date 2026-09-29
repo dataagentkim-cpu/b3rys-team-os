@@ -32,6 +32,7 @@ import { startSchedulerWorker } from "./workers/schedulerWorker";
 import { startFollowupWorker } from "./workers/followupWorker";
 import { startDmSyncWorker } from "./workers/dmSyncWorker";
 import { classifyAll } from "./lib/health";
+import { quotaBlockMap } from "./lib/runtimeQuota";
 import { startWakeDispatcher } from "./bus/wakeDispatcher";
 import { computeLearningStats } from "./lib/learningStats";
 import { teamOsSnapshot } from "./lib/teamosProbe";
@@ -42,6 +43,7 @@ import { loadAgentCreds, hasSlackTokenFile } from "./lib/slack";
 import { createRouterRoutes } from "./routes/router";
 import { createBusRoutes } from "./routes/bus";
 import { createMonitoringRoutes } from "./routes/monitoring";
+import { createNotesRoutes } from "./routes/notes";
 import { createTaskRoutes } from "./routes/tasks";
 import { createProposalRoutes } from "./routes/proposals";
 import { createSearchRoutes } from "./routes/search";
@@ -53,6 +55,7 @@ import { createSchedulerRoutes } from "./routes/scheduler";
 import { createCiStatusRoutes } from "./routes/ciStatus";
 import { ensureDailyTaskReviewJobs, ensureOpsJobs, ensureWeeklySelfLearningJobs } from "./scheduler/core";
 import { renderAndRepoint } from "./lib/teamOsRender";
+import { renderSkillsMd } from "./lib/skillsRender";
 import { installProgressHook, repairProgressHook, repairReplyGuardHook, ensureOwnerGateHook } from "./runtimes/claude/launcher";
 import { writeMemberPersona, savePersonaFile } from "./lib/writeMemberPersona";
 import { refreshLoadingFiles } from "./lib/refreshLoadingFiles";
@@ -60,6 +63,8 @@ import { persistOwnerChatIdIfEmpty } from "./runtimes/codex/launcher";
 import { createApprovalsApp } from "./routes/approvals";
 import { createPermissionGateRoutes } from "./routes/permissionGate";
 import { buildMcpHttpApp } from "./mcp/mcpHttpRoute";
+import { apiCfGate } from "./lib/apiCfGate";
+import { appendAuditFile } from "./lib/auditFile";
 import { configureLeadActorDb, leadActorId, trustedActorFromRequest } from "./lib/opAuth";
 import { createHostGate } from "./lib/hostGate";
 import { DEFAULT_MEDIA_DIR, contentTypeForMediaFile, resolveMediaPath } from "./lib/mediaStore";
@@ -152,6 +157,7 @@ try {
   const ownerRow = db.query("SELECT value FROM setting WHERE key = 'owner_name'").get() as { value: string } | null;
   const claudeIds = agents.filter((a) => a.runtime === "claude_channel").map((a) => a.id);
   const rr = renderAndRepoint(ownerRow?.value ?? null, claudeIds);
+  { const sk = renderSkillsMd(); if (!sk.ok) console.error(`[boot] rules/SKILLS.md 렌더 실패: ${sk.error}`); }
   console.log(`[teamos-render] owner='${rr.owner}' repointed=${rr.repointed.join(",") || "none"}`);
 
   // ★팀 학습 로그도 없으면 만든다★ — TEAM-OS.md 와 같은 방식(템플릿만 track, 실사용 파일은 생성).
@@ -280,6 +286,10 @@ const app = new Hono();
 
 
 const api = new Hono();
+// ★/api 원격 게이트 — 맨 앞에 둔다.★ Hono 는 등록 순서대로 실행하므로 라우트 뒤에 두면 그 라우트는 검사 없이 답한다.
+//   로컬 호출(Host=loopback, CF 헤더 없음)은 검사 없이 통과 — 팀원 스크립트·대시보드 로컬 경로 그대로.
+//   원격(터널 경유)은 CF Access 증명서(JWT)를 검증한다. env B3OS_API_CF_AUD 가 비어 있으면 게이트는 꺼져 있다(현행 유지).
+api.use("*", apiCfGate({ onDeny: (reason, detail) => appendAuditFile("api_cf_gate", "denied", reason, detail) }));
 api.route("/", createProjectRoutes({ db }));
 
 api.use("*", async (c, next) => {
@@ -329,7 +339,7 @@ api.get("/alerts", (c) => {
 
 // Per-agent health classification (health-check Phase 1, observe-only).
 api.get("/health/agents", (c) => {
-  const verdicts = classifyAll(listStatuses(db), agents);
+  const verdicts = classifyAll(listStatuses(db), agents, Date.now(), quotaBlockMap(db));
   const summary = {
     danger: verdicts.filter((v) => v.level === "danger").map((v) => v.agentId),
     warn: verdicts.filter((v) => v.level === "warn").map((v) => v.agentId),
@@ -461,6 +471,9 @@ api.route("/", busApi);
 
 const monitoringApi = createMonitoringRoutes({ db });
 api.route("/", monitoringApi);
+
+// 팀원 → 팀장 편집기(Steno) 파일 우편함. 원격은 위 apiCfGate 를 지난다.
+api.route("/", createNotesRoutes({ db, memberIds: () => agents.map((a) => a.id) }));
 
 // CI 결과는 ★읽기 전용★ — 여기서 테스트를 돌리지 않는다(routes/ciStatus.ts 주석 참고).
 const ciStatusApi = createCiStatusRoutes();

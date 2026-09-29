@@ -7,6 +7,15 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { Window } from "happy-dom";
 import fixture from "../fixtures/projects-steno.example.json";
 
+// 가짜 mermaid — 진짜(5MB)는 테스트에서 안 받는다. render 가 준 svg 를 figure 에 넣는 절차만 잰다.
+const fakeMermaid = {
+  calls: [] as { id: string; src: string }[],
+  fail: false,
+  initialized: null as Record<string, unknown> | null,
+  initialize(cfg: Record<string, unknown>) { this.initialized = cfg; },
+  async render(id: string, src: string) { this.calls.push({ id, src }); if (this.fail) throw new Error("parse"); return { svg: `<svg data-fake="1" data-id="${id}"></svg>` }; },
+};
+
 const installedGlobals: string[] = [];
 const savedGlobals: Record<string, unknown> = {};
 let previousFetch: typeof fetch;
@@ -81,8 +90,10 @@ afterAll(() => {
 const tick = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function mount(): Promise<HTMLElement> {
-  const { renderProjects, resetProjectsState } = await import("./Projects");
+  const { renderProjects, resetProjectsState, setMermaidLoader } = await import("./Projects");
   resetProjectsState();
+  fakeMermaid.calls = []; fakeMermaid.fail = false; fakeMermaid.initialized = null;
+  setMermaidLoader(() => Promise.resolve(fakeMermaid));
   const root = document.createElement("div");
   document.body.appendChild(root);
   renderProjects(root);
@@ -151,11 +162,14 @@ describe("Projects 문서 화면", () => {
     // 본문은 전체 문서 — h2 3개 모두, 2절의 mermaid 도 이미 있다(서버 figcaption 만, 클라 배지 없음)
     expect(root.querySelectorAll("#projects-viewer h2")).toHaveLength(3);
     expect(root.querySelectorAll("#projects-viewer article")).toHaveLength(1);
-    expect(root.querySelectorAll("#projects-viewer pre.mermaid-src")).toHaveLength(1);
-    expect(root.querySelectorAll("#projects-viewer .mermaid-pending")).toHaveLength(1);
-    expect(root.querySelectorAll("#projects-viewer .projects-mermaid-badge")).toHaveLength(0);
-    // 트리 칸은 데스크톱 220px 열, 모바일은 접힘(목차 버튼)
-    expect(toc.parentElement?.className).toContain("md:grid-cols-[220px_minmax(0,1fr)]");
+    // 2절의 mermaid figure 는 (가짜) mermaid 로 SVG 가 됐다 — 원문 <pre>·"렌더 예정" 캡션은 사라진다
+    expect(root.querySelectorAll("#projects-viewer figure.project-diagram[data-rendered=\"1\"] .project-diagram-svg svg[data-fake]")).toHaveLength(1);
+    expect(root.querySelectorAll("#projects-viewer pre.mermaid-src")).toHaveLength(0);
+    expect(root.querySelectorAll("#projects-viewer .mermaid-pending")).toHaveLength(0);
+    expect(fakeMermaid.calls.map((c) => c.src.trim().split("\n")[0])).toEqual(["flowchart TB"]);
+    expect(fakeMermaid.initialized?.securityLevel).toBe("strict");
+    // 트리 칸은 데스크톱 240px 열, 모바일은 접힘(목차 버튼)
+    expect(toc.parentElement?.className).toContain("md:grid-cols-[240px_minmax(0,1fr)]");
     expect(toc.className).toContain("hidden");
     expect(root.querySelector("#projects-toc-toggle")?.getAttribute("aria-expanded")).toBe("false");
     const sha7 = fixture.summary.sha.slice(0, 7);
@@ -445,7 +459,7 @@ describe("서버 404 폴백", () => {
     root.querySelector<HTMLButtonElement>('button.projects-chip[data-doc="design"]')!.click();
     await tick();
     expect(root.querySelectorAll(".projects-toc-sec")).toHaveLength(3);
-    expect(root.querySelectorAll("#projects-viewer pre.mermaid-src")).toHaveLength(1);
+    expect(root.querySelectorAll("#projects-viewer figure.project-diagram .project-diagram-svg svg[data-fake]")).toHaveLength(1); // fixture 의 mermaid 도 (가짜로) 렌더
     root.querySelector<HTMLButtonElement>('.projects-mode[data-mode="md"]')!.click();
     await tick();
     expect(root.querySelector("#projects-viewer pre.projects-raw")?.textContent).toContain("# Steno 설계");
@@ -505,5 +519,136 @@ describe("splitSections — 순수 함수", () => {
     expect(one).toHaveLength(1);
     expect(one[0]!.anchor).toBe("t");
     expect(one[0]!.html).toBe(`${H(1, "t")}<p>본문</p>`);
+  });
+});
+
+describe("문서 헤더 — 한 줄 · 문서 전환 칩 · 새창 · 글자 크기 (팀장 2026-09-18)", () => {
+  test("헤더 첫 줄에 GitHub(아이콘+글자)·문서 칩·새창·HTML/MD 가 있고, 현재 문서 칩은 선택 모양", async () => {
+    const root = await mount();
+    root.querySelector<HTMLButtonElement>('button.projects-chip[data-doc="design"]')!.click();
+    await tick();
+    const gh = root.querySelector<HTMLAnchorElement>("#projects-open-github")!;
+    expect(gh.textContent).toContain("GitHub");
+    expect(gh.querySelector("svg")).not.toBeNull();
+    const chips = [...root.querySelectorAll(".projects-doc-chip")].map((c) => c.textContent?.trim());
+    expect(chips).toEqual(["README", "DESIGN", "FEATURES", "TODO"]);
+    expect(root.querySelector('.projects-doc-chip[aria-current="page"]')?.textContent?.trim()).toBe("DESIGN");
+    expect(root.querySelectorAll("button[data-doc-chip]")).toHaveLength(3);
+    const win = root.querySelector<HTMLAnchorElement>("#projects-open-window")!;
+    expect(win.getAttribute("href")).toContain("/api/projects/steno/doc/design/page");
+    expect(win.getAttribute("href")).not.toContain("mode=md");
+    expect(win.getAttribute("target")).toBe("_blank");
+  });
+
+  test("메타 줄에 프로젝트 이름·파일·sha 가 있고, sticky 헤더 높이를 재서 --projects-head 로 반영한다", async () => {
+    const root = await mount();
+    root.querySelector<HTMLButtonElement>('button.projects-chip[data-doc="design"]')!.click();
+    await tick();
+    const head = root.querySelector<HTMLElement>("[data-projects-doc-head]")!;
+    expect(head).not.toBeNull();
+    expect(head.textContent).toContain("Steno · DESIGN.md");
+    const { measureHeadOffset } = await import("./Projects");
+    // happy-dom 은 레이아웃이 없어 0 → 기본값 유지, 변수도 안 박는다
+    expect(measureHeadOffset()).toBe(72);
+    expect(root.style.getPropertyValue("--projects-head")).toBe("");
+    Object.defineProperty(head, "offsetHeight", { value: 54, configurable: true });
+    expect(measureHeadOffset()).toBe(66);
+    expect(root.style.getPropertyValue("--projects-head")).toBe("66px");
+  });
+
+  test("칩으로 다른 문서로 넘어가면 HTML/MD 모드가 유지되고 새창 링크도 그 모드·그 문서를 가리킨다", async () => {
+    const root = await mount();
+    root.querySelector<HTMLButtonElement>('button.projects-chip[data-doc="design"]')!.click();
+    await tick();
+    root.querySelector<HTMLButtonElement>('.projects-mode[data-mode="md"]')!.click();
+    await tick();
+    root.querySelector<HTMLButtonElement>('button[data-doc-chip="features"]')!.click();
+    await tick();
+    expect(new URLSearchParams(window.location.search).get("doc")).toBe("features");
+    expect(root.querySelector('.projects-doc-chip[aria-current="page"]')?.textContent?.trim()).toBe("FEATURES");
+    expect(root.querySelector('.projects-mode[data-mode="md"]')?.getAttribute("aria-pressed")).toBe("true");
+    expect(root.querySelector<HTMLAnchorElement>("#projects-open-window")!.getAttribute("href")).toContain("/doc/features/page?mode=md");
+  });
+
+  test("목차 글자는 이모지·장식 기호를 뺀다(tocLabel) — 본문 제목·title 은 원문 그대로", async () => {
+    const { tocLabel } = await import("./Projects");
+    expect(tocLabel("🔄 실사용 피드백 (2026-01-01)")).toBe("실사용 피드백 (2026-01-01)");
+    expect(tocLabel("📌 예시 절 — ★나중에 손본다★")).toBe("예시 절 — 나중에 손본다");
+    expect(tocLabel("🎯 목표 (2026-01-02 10:00) — 킵")).toBe("목표 (2026-01-02 10:00) — 킵");
+    expect(tocLabel("✅ 완료된 것 🧹")).toBe("완료된 것");
+    expect(tocLabel("1단계 — 편집기 만들기")).toBe("1단계 — 편집기 만들기");
+    expect(tocLabel("★ 킵 ★ 하나")).toBe("킵 하나");   // 공백 축약
+    expect(tocLabel("—킵—")).toBe("킵");               // 앞뒤 대시
+    expect(tocLabel("완료: ✅")).toBe("완료");           // 뒤 콜론
+    expect(tocLabel("👍🏽 굿")).toBe("굿");              // 피부색 수식자까지
+    expect(tocLabel("🎉")).toBe("🎉"); // 전부 기호면 원문 유지
+    // DOM: 목차 글자는 정리본, title 은 원문
+    const root = await mount();
+    root.querySelector<HTMLButtonElement>('button.projects-chip[data-doc="todo"]')!.click();
+    await tick();
+    root.querySelector<HTMLButtonElement>('button[data-todo-tab="all"]')?.click();
+    await tick();
+    const heads = [...root.querySelectorAll<HTMLButtonElement>(".projects-toc-head")];
+    const decorated = heads.find((b) => /\p{Extended_Pictographic}/u.test(b.title));
+    expect(decorated).toBeDefined();
+    expect(decorated!.textContent?.trim()).toBe(tocLabel(decorated!.title));
+    expect(decorated!.textContent?.trim()).not.toBe(decorated!.title);
+    expect(decorated!.querySelector(".projects-toc-label")).not.toBeNull();
+  });
+
+  test("mermaid 문법 오류면 원문 <pre> 를 두고 캡션만 오류 문구로 — 로더 실패면 서버 캡션 그대로", async () => {
+    const root = await mount();          // mount 가 fail 을 초기화하므로 그 뒤에 켠다
+    fakeMermaid.fail = true;
+    root.querySelector<HTMLButtonElement>('button.projects-chip[data-doc="design"]')!.click();
+    await tick();
+    const fig = root.querySelector<HTMLElement>("#projects-viewer figure.project-diagram")!;
+    expect(fig.dataset.rendered).toBe("error");
+    expect(fig.querySelector("pre.mermaid-src")).not.toBeNull();
+    expect(fig.querySelector(".mermaid-pending")?.textContent).toContain("문법 오류");
+    // 로더 자체가 실패하면(청크 못 받음) 서버가 넣은 "렌더 예정" 캡션과 원문이 그대로 남는다
+    const { setMermaidLoader, resetProjectsState, renderProjects } = await import("./Projects");
+    resetProjectsState();
+    setMermaidLoader(() => Promise.reject(new Error("chunk")));
+    const root2 = document.createElement("div"); document.body.appendChild(root2); renderProjects(root2); await tick();
+    root2.querySelector<HTMLButtonElement>('button.projects-chip[data-doc="design"]')?.click(); // URL 이 이미 design 딥링크면 목록 칩이 없다
+    await tick();
+    const fig2 = root2.querySelector<HTMLElement>("#projects-viewer figure.project-diagram")!;
+    expect(fig2.dataset.rendered).toBeUndefined();
+    expect(fig2.querySelector(".mermaid-pending")?.textContent).toContain("렌더 예정");
+    expect(fig2.querySelector("pre.mermaid-src")).not.toBeNull();
+  });
+
+  test("목록 카드에도 새창 링크(README·HTML 로 시작)", async () => {
+    const root = await mount();
+    const a = root.querySelector<HTMLAnchorElement>(".projects-window")!;
+    expect(a.getAttribute("href")).toContain("/api/projects/steno/doc/readme/page");
+    expect(a.getAttribute("target")).toBe("_blank");
+  });
+
+  test("⌘= / ⌘− / ⌘0 — 문서 화면에서만 90/100/110/125 를 오가고 % 배지를 띄운다 · 목록에서는 무시", async () => {
+    const { handleZoomKey, currentZoom, setProjectsVisible } = await import("./Projects");
+    const root = await mount();
+    const key = (k: string) => { const e = new window.KeyboardEvent("keydown", { key: k, metaKey: true, cancelable: true }); const handled = handleZoomKey(e as unknown as KeyboardEvent); return { handled, prevented: e.defaultPrevented }; };
+    expect(key("=").handled).toBe(false);      // 목록 화면 — 브라우저 확대에 맡긴다
+    root.querySelector<HTMLButtonElement>('button.projects-chip[data-doc="design"]')!.click();
+    await tick();
+    expect(key("=")).toEqual({ handled: true, prevented: true });
+    expect(currentZoom()).toBe(110);
+    expect(root.style.getPropertyValue("--projects-zoom")).toBe("1.1");
+    expect(document.getElementById("projects-zoom-badge")?.textContent).toBe("110%");
+    key("="); expect(currentZoom()).toBe(125);
+    key("="); expect(currentZoom()).toBe(125);  // 상한
+    key("-"); key("-"); key("-"); expect(currentZoom()).toBe(90);
+    key("-"); expect(currentZoom()).toBe(90);   // 하한
+    key("0"); expect(currentZoom()).toBe(100);
+    expect(window.localStorage.getItem("bill-dash-projects-zoom")).toBe("100");
+    setProjectsVisible(false);                  // 다른 탭 — 브라우저 확대를 가로채지 않는다
+    expect(key("=")).toEqual({ handled: false, prevented: false });
+    expect(currentZoom()).toBe(100);
+    setProjectsVisible(true);
+    expect(key("=").handled).toBe(true);
+    expect(currentZoom()).toBe(110);
+    key("0");
+    document.getElementById("projects-zoom-badge")?.remove();
   });
 });

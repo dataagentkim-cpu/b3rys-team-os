@@ -29,6 +29,7 @@ send.sh --to <물어본 사람> --thread <온 thread> --in-reply-to <그 메시�
     본문에 그렇게 쓴다. 플래그는 그 팀원이 ★자기 답에★ 붙인다.
 - **메시지 읽음 처리** → `ack.sh`
 - **팀버스 맥락 조회** ("팀버스 그거 어떻게 됐어?", "GD가 코덱스한테 뭐 시켰어?") → `bus-recall.sh` (read-only, team.db 조회. 뒤지기 대신 요점 확인)
+- **보고서 파일을 팀장 편집기(Steno)로 보내기** (md·html) → `steno-send.sh <파일> [--name <이름>]` — 팀장 Steno 의 "받은 파일/" 에 들어간다. 보낸 이는 자동, 쌓기만 한다(덮어쓰기·삭제 없음, 고친 판은 새로 보낸다). 서버: `POST /team/api/notes`.
 
 서버: `http://127.0.0.1:7878/team/api/inbox` (loopback).
 
@@ -181,8 +182,7 @@ skills/b3os-team-inbox/scripts/bus-recall.sh --me ames --with bill
 
 ## 슬랙에 글 올리기 (`slack-post.sh`)
 
-★도구는 처음부터 있었는데 이 문서가 안 가리켜서, 2026-07-27 에 팀원 둘이 각자 코드를 뒤져
-서로 다른 경로를 팠다★(한 명은 봇 토큰 파일을 직접 열었다 — 그게 제일 나쁘다). 정본은 이것 하나다.
+★슬랙 게시 경로는 이것 하나다.★ 코드를 뒤져 다른 경로를 만들지 않는다 — 특히 봇 토큰 파일을 직접 열지 않는다.
 
 ```bash
 skills/b3os-team-inbox/scripts/slack-post.sh --channel <C...> --text "..."

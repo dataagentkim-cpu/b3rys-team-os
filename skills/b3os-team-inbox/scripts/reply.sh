@@ -4,7 +4,7 @@
 #   요청자 inbox 에 정확히 도착한다(broadcast 로 묻히지 않음). 이 도구가 그 주소를 자동으로 채운다 —
 #   에이전트는 "이 메시지에 답해"만 하면 to=원발신자 · in_reply_to=그 메시지 · thread=그 thread 가 자동 설정.
 #
-# Usage: reply.sh <message_id> --body "..." [--priority low|normal|high] [--hop <n>]
+# Usage: reply.sh <message_id> (--body "..." | --body-file <경로>) [--priority low|normal|high] [--hop <n>]
 #   message_id 는 inbox.sh / thread.sh 출력에 보이는 그 메시지 id.
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -15,11 +15,34 @@ MID="${1:-}"
 case "$MID" in --*) echo "usage: reply.sh <message_id> --body \"...\"  (첫 인자는 메시지 id)" >&2; exit 1 ;; esac
 shift
 
-BODY=""; PRIORITY="normal"; FROM=""; HOP=""; DRY=""
+BODY=""; PRIORITY="normal"; FROM=""; HOP=""; DRY=""; BODY_FILE=""; BODY_SET=""
+
+# ★같은 플래그를 두 번 받으면 죽는다★ — send.sh 의 dup_guard 와 같은 형태다.
+#   실측: `reply.sh <id> --body "AAA" --body "BBB"` 가 ★에러 없이 BBB 로 덮이고 exit 0★ 이다.
+#   ★send.sh 의 가드는 이걸 볼 수 없다★ — reply.sh 는 ARGS 배열에 `--body` 를 한 번만 실어
+#   넘기므로, 덮인 뒤의 값 하나만 건너간다. 그래서 reply.sh 자체에 가드가 필요하다.
+#   반복 지정이 정상인 플래그는 reply.sh 에 없다(`--mention` 미지원 — send.sh 의 예외는 해당 없음).
+SEEN_FLAGS=""
+dup_guard() {
+  case " $SEEN_FLAGS " in
+    *" $1 "*)
+      echo "✖ 같은 플래그를 중복 지정했다: $1" >&2
+      echo "  본문에 큰따옴표가 있으면 셸이 인용을 끊어 인자가 쪼개지고, 쪼개진 토큰이" >&2
+      echo "  우연히 플래그로 먹힐 수 있다 — 본문이나 우선순위가 조용히 바뀐다." >&2
+      echo "  본문은 --body-file <경로> 로 보내라." >&2
+      exit 1 ;;
+  esac
+  SEEN_FLAGS="$SEEN_FLAGS $1"
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --body) BODY="$2"; shift 2 ;;
-    --priority) PRIORITY="$2"; shift 2 ;;
+    --body) dup_guard --body; BODY="$2"; BODY_SET=1; shift 2 ;;
+    # ★--body-file — 본문을 셸 명령줄에 싣지 않는 경로★ (send.sh --body-file · slack-post.sh --text-file 과 같은 이유)
+    #   본문에 홑따옴표·백틱·$(cmd)·$VAR·큰따옴표가 있으면 셸이 그것을 해석하거나 인자를 쪼갠다.
+    #   send.sh 에는 이 경로가 있었는데 reply.sh 에는 없어서, 답장은 본문을 명령줄로만 보낼 수 있었다.
+    --body-file) dup_guard --body-file; BODY_FILE="$2"; shift 2 ;;
+    --priority) dup_guard --priority; PRIORITY="$2"; shift 2 ;;
     # ★--from 은 막는다★ — send.sh 와 같은 이유 (2026-07-14 신원 사고).
     #   신원은 ★사실★ 이다(워크스페이스 → _me.sh). 모델에게 물으면 남의 이름을 적는다.
     --from)
@@ -28,12 +51,38 @@ while [ $# -gt 0 ]; do
         exit 1
       fi
       FROM="$2"; shift 2 ;;
-    --hop) HOP="$2"; shift 2 ;;
+    --hop) dup_guard --hop; HOP="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
-    *) echo "unknown arg: $1" >&2; exit 1 ;;
+    # 모르는 인자의 흔한 원인은 오타가 아니라 본문이 셸에서 쪼개졌기 때문이다 — 다음 행동을 같이 적는다.
+    *) echo "unknown arg: $1" >&2
+       echo "  본문에 큰따옴표가 있으면 셸이 인자를 쪼개 이런 토큰이 생긴다 — 본문은 --body-file <경로> 로 보내라." >&2
+       exit 1 ;;
   esac
 done
-[ -z "$BODY" ] && { echo "ERROR: --body required" >&2; exit 1; }
+# ★--body 와 --body-file 을 동시에 주면 거절한다★ — 어느 쪽이 이겼는지 조용히 정해지면
+#   보낸 사람이 아는 본문과 실제로 간 본문이 달라진다 (send.sh 와 같은 판단).
+if [ -n "$BODY_FILE" ] && [ -n "$BODY_SET" ]; then
+  echo "ERROR: --body 와 --body-file 은 동시에 쓸 수 없습니다 (하나만 지정하세요)" >&2; exit 1
+fi
+if [ -n "$BODY_FILE" ]; then
+  # 없거나 못 읽으면 죽는다. 빈 본문으로 보내면 '보냈다' 는 기록만 남고 내용이 사라진다.
+  [ -e "$BODY_FILE" ] || { echo "ERROR: --body-file 경로가 없습니다: $BODY_FILE" >&2; exit 1; }
+  [ -f "$BODY_FILE" ] || { echo "ERROR: --body-file 이 일반 파일이 아닙니다: $BODY_FILE" >&2; exit 1; }
+  [ -r "$BODY_FILE" ] || { echo "ERROR: --body-file 을 읽을 수 없습니다(권한): $BODY_FILE" >&2; exit 1; }
+  BODY="$(cat -- "$BODY_FILE")"
+  [ -n "$BODY" ] || { echo "ERROR: --body-file 이 비어 있습니다: $BODY_FILE" >&2; exit 1; }
+fi
+[ -z "$BODY" ] && { echo "ERROR: --body 또는 --body-file 이 필요합니다" >&2; exit 1; }
+
+# ★--priority 화이트리스트★ — 값에 공백이 섞이는 것이 인자 쪼개짐의 서명이다.
+#   send.sh 도 같은 검사를 하지만 거기까지 가면 사람이 읽는 오류가 한 단계 멀어진다.
+#   여기서 죽으면 어느 명령의 어느 인자가 틀렸는지가 바로 보인다.
+case "$PRIORITY" in
+  low|normal|high) ;;
+  *) echo "✖ --priority 는 low|normal|high 중 하나여야 한다 (받은 값: '$PRIORITY')" >&2
+     echo "  값에 공백이 섞여 있으면 본문이 셸에서 쪼개진 것이다 — 본문은 --body-file <경로> 로 보내라." >&2
+     exit 1 ;;
+esac
 
 # 원본 메시지 해석 → from(=답장 대상), thread
 RESOLVED=$(curl -sS "$BASE/api/messages/$MID")
