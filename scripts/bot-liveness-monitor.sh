@@ -427,7 +427,10 @@ for bot in "${BOTS[@]}"; do
 "
     else
       restart_budget_spend
-      "$RESTART_AGENT" "$bot" >/dev/null 2>&1   # 폴러 검증 포함(한도 45회 = 실측 ~51s). team-os 경유 안 함 = lui 포함
+      # ★재시작이라는 사실을 자식까지 전파한다★ — 세션 수 상한이 이 경로를 새 기동으로
+      #   오인하면 자동복구가 멤버를 영구 다운시킨다. env 를 앞에 붙이면 RESTART_AGENT 가
+      #   안에서 무엇을 부르든 그 자식까지 따라간다.
+      B3OS_SESSION_RESTART=1 "$RESTART_AGENT" "$bot" >/dev/null 2>&1   # 폴러 검증 포함(한도 45회 = 실측 ~51s). team-os 경유 안 함 = lui 포함
       if tmux has-session -t "$session" 2>/dev/null; then
         HEALED="${HEALED}· [$bot] tmux 세션 없음 → team-os up 자동복구 ✓
 "
@@ -491,7 +494,9 @@ for bot in "${BOTS[@]}"; do
       restart_budget_spend
       touch "$hmark" 2>/dev/null   # 쿨다운 마커 — 다음 run이 40분내 재발이면 재시작 보류(thrash 방지)
       tmux kill-session -t "$session" 2>/dev/null; sleep 2
-      "$RESTART_AGENT" "$bot" >/dev/null 2>&1; sleep 4
+      # 바로 위에서 죽였다 — 세션 수가 늘지 않는 재시작이다. 상한을 보게 두면
+      # 죽여놓고 못 살린다(위 430 과 같은 이유).
+      B3OS_SESSION_RESTART=1 "$RESTART_AGENT" "$bot" >/dev/null 2>&1; sleep 4
       if [ -s "$pidf" ] && kill -0 "$(cat "$pidf" 2>/dev/null)" 2>/dev/null; then
         HEALED="${HEALED}· [$bot] 폴러 사망 → 클린 재시작 자동복구 ✓
 "
