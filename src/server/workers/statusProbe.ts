@@ -12,40 +12,52 @@ import { hermesBinary } from "../lib/paths";
 
 const POLL_INTERVAL_MS = 5000;
 const IDLE_AFTER_MS = 60_000;
+// tmux 가 응답을 멈추면 자식이 영원히 안 끝난다. 타임아웃 없이 폴링하면 프로세스가 쌓인다.
+const TMUX_TIMEOUT_MS = 5000;
 
-async function tmuxSessionExists(session: string): Promise<boolean> {
+/** tmux 자식을 띄우되 TMUX_TIMEOUT_MS 안에 안 끝나면 SIGKILL 하고 fallback 을 돌려준다. */
+function runTmux<T>(
+  args: string[],
+  fallback: T,
+  parse: (stdout: string, code: number | null) => T,
+): Promise<T> {
   return new Promise((resolve) => {
-    const proc = spawn("tmux", ["has-session", "-t", session]);
-    proc.on("error", () => resolve(false));
-    proc.on("close", (code) => resolve(code === 0));
+    const proc = spawn("tmux", args);
+    let out = "";
+    let settled = false;
+    const finish = (v: T) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(v);
+    };
+    const timer = setTimeout(() => {
+      proc.kill("SIGKILL");
+      finish(fallback);
+    }, TMUX_TIMEOUT_MS);
+    proc.stdout?.on("data", (c) => (out += c.toString()));
+    proc.on("error", () => finish(fallback));
+    proc.on("close", (code) => finish(parse(out, code)));
   });
 }
 
+async function tmuxSessionExists(session: string): Promise<boolean> {
+  return runTmux(["has-session", "-t", session], false, (_out, code) => code === 0);
+}
+
 async function tmuxPid(session: string): Promise<number | null> {
-  return new Promise((resolve) => {
-    const proc = spawn("tmux", ["list-panes", "-t", session, "-F", "#{pane_pid}"]);
-    let out = "";
-    proc.stdout.on("data", (c) => (out += c.toString()));
-    proc.on("error", () => resolve(null));
-    proc.on("close", () => {
-      const pid = parseInt(out.trim().split("\n")[0] ?? "", 10);
-      resolve(Number.isFinite(pid) ? pid : null);
-    });
+  return runTmux(["list-panes", "-t", session, "-F", "#{pane_pid}"], null, (out) => {
+    const pid = parseInt(out.trim().split("\n")[0] ?? "", 10);
+    return Number.isFinite(pid) ? pid : null;
   });
 }
 
 async function captureTmuxPane(session: string): Promise<string[]> {
-  return new Promise((resolve) => {
-    const proc = spawn("tmux", ["capture-pane", "-p", "-t", session, "-S", "-80"]);
-    let out = "";
-    proc.stdout.on("data", (c) => (out += c.toString()));
-    proc.on("error", () => resolve([]));
-    proc.on("close", (code) => {
-      if (code !== 0) return resolve([]);
-      const lines = out.split("\n");
-      while (lines.length && lines[lines.length - 1]?.trim() === "") lines.pop();
-      resolve(lines);
-    });
+  return runTmux(["capture-pane", "-p", "-t", session, "-S", "-80"], [] as string[], (out, code) => {
+    if (code !== 0) return [];
+    const lines = out.split("\n");
+    while (lines.length && lines[lines.length - 1]?.trim() === "") lines.pop();
+    return lines;
   });
 }
 
@@ -463,7 +475,15 @@ export function startStatusProbe(
   };
 
   void probe();
-  const interval = setInterval(() => void probe(), POLL_INTERVAL_MS);
+  // 이전 probe 가 아직 안 끝났으면 건너뛴다 — 겹쳐 돌면 tmux 자식이 누적된다.
+  let inFlight = false;
+  const interval = setInterval(() => {
+    if (inFlight) return;
+    inFlight = true;
+    void probe().finally(() => {
+      inFlight = false;
+    });
+  }, POLL_INTERVAL_MS);
   return () => {
     stopped = true;
     clearInterval(interval);
