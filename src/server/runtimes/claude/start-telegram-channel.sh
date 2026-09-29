@@ -189,6 +189,8 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   if [[ $FORCE_FLAG -eq 1 ]]; then
     echo "Force restart — killing existing session '$SESSION_NAME'."
     tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+    # 방금 하나를 죽이고 하나를 만든다 — 세션 수가 늘지 않는다. 아래 상한 검사를 건너뛴다.
+    RESTART_INTENT=1
     sleep 1
   else
     echo "Session '$SESSION_NAME' already running."
@@ -198,30 +200,43 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
 fi
 
 # ─── 세션 수 상한 ─────────────────────────────────────────────────────────
-# 여기까지 왔다는 것은 ★세션이 하나 늘어난다★ 는 뜻이다. 위의 has-session 분기에서
-#   - 이미 있고 --force 아님  → exit 0 (수가 안 는다)
-#   - 이미 있고 --force       → kill 후 재생성 (수가 안 는다)
-# 이 둘은 이미 빠져나갔다. 그래서 상한은 기동 진입부가 아니라 이 지점에서 본다.
-# 진입부에서 보면 재기동·복구까지 상한에 걸려 막힌다.
+# 막아야 하는 것은 기동이 아니라 ★세션이 하나 늘어나는 것★ 이다. 그 둘을 위치로
+# 구분할 수 없다 — 호출부가 tmux kill-session 을 먼저 하고 이 스크립트를 부르는
+# 재시작 경로가 있어서, 여기 도달했을 때 세션이 이미 없는 경우가 있다. 그때
+# 위치로만 판단하면 재시작을 새 세션으로 오인해 상한으로 막고, ★죽여놓고 못 살린다.★
+# (같은 실패를 막으려고 위쪽 vendoring 경로가 기동 수단을 먼저 확인한 뒤에 죽인다.)
 #
-# 넘었을 때 ★죽이지 않는다★ — 실행 중 세션은 진행 중 작업을 들고 있고, 그것을 잃는
-# 비용이 메모리보다 크다. 새로 띄우는 것만 멈추고 사실을 출력한다.
+# 그래서 위치가 아니라 ★신호★ 로 판정한다:
+#   · B3OS_SESSION_RESTART=1 — 호출부가 "이것은 재시작이다" 를 명시한 경우
+#   · RESTART_INTENT=1        — 이 스크립트가 위 force 분기에서 직접 죽인 경우
+# 둘 중 하나면 수가 늘지 않으므로 상한을 보지 않는다.
 #
-# 임계값과 세는 법은 한 파일에만 둔다(B3OS_CAPACITY_LIB). 두 곳에 복사하면 한쪽만
-# 고쳐져 갈라진다. 그 파일이 없는 설치에서는 게이트를 걸지 않고, 걸지 않았다는 것을
-# 출력한다 — 조용히 통과하면 상한이 있다고 오해한다.
-CAPACITY_LIB="${B3OS_CAPACITY_LIB:-$HOME/b3os/ops/lib/capacity-check.sh}"
-if [[ -r "$CAPACITY_LIB" ]]; then
-  # shellcheck source=/dev/null
-  source "$CAPACITY_LIB"
-  if ! b3os_session_slot_available; then
-    echo "ERROR: 멤버 세션이 상한입니다 — $(b3os_member_sessions)/$B3OS_MAX_MEMBER_SESSIONS. '$SESSION_NAME' 을 띄우지 않습니다." >&2
-    echo "  실행 중인 세션은 그대로 둡니다. 끝난 세션을 닫거나 B3OS_MAX_MEMBER_SESSIONS 를 올리십시오." >&2
-    b3os_capacity_report >&2
-    exit 3
-  fi
+# 상한을 넘어도 ★실행 중 세션을 죽이지 않는다★ — 실행 중 세션은 진행 중 작업을 들고
+# 있고, 그것을 잃는 비용이 확보되는 메모리보다 크다. 새로 띄우는 것만 멈춘다.
+[[ "${B3OS_SESSION_RESTART:-}" == "1" || "${B3OS_SESSION_RESTART:-}" == "true" ]] && RESTART_INTENT=1
+if [[ "${RESTART_INTENT:-0}" -eq 1 ]]; then
+  echo "재시작 — 세션 수가 늘지 않으므로 상한을 검사하지 않습니다."
 else
-  echo "NOTE: 용량 상한 파일이 없어 세션 수를 검사하지 않았습니다 ($CAPACITY_LIB)." >&2
+  # 임계값과 세는 법은 한 파일에만 둔다. 기본값은 이 스크립트 옆의 vendoring 된 사본이라
+  # clean checkout 에서도 게이트가 존재한다. 그래도 못 찾으면 ★조용히 통과하지 않고★
+  # 검사하지 않았다는 사실을 출력한다 — 조용히 통과하면 상한이 있다고 오해한다.
+  _CAP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  CAPACITY_LIB="${B3OS_CAPACITY_LIB:-$_CAP_DIR/capacity-check.sh}"
+  if [[ -r "$CAPACITY_LIB" ]]; then
+    # shellcheck source=/dev/null
+    source "$CAPACITY_LIB"
+    if ! b3os_capacity_usable; then
+      echo "NOTE: tmux 를 찾지 못해 세션 수를 검사하지 않았습니다 ($TMUX_BIN)." >&2
+    elif ! b3os_session_slot_available; then
+      echo "ERROR: 멤버 세션이 상한입니다 — $(b3os_member_sessions)/$B3OS_MAX_MEMBER_SESSIONS. '$SESSION_NAME' 을 띄우지 않습니다." >&2
+      echo "  실행 중인 세션은 그대로 둡니다. 끝난 세션을 닫거나 B3OS_MAX_MEMBER_SESSIONS 를 올리십시오." >&2
+      echo "  재시작이라면 B3OS_SESSION_RESTART=1 을 실어 부르십시오 — 그 경로는 상한을 보지 않습니다." >&2
+      b3os_capacity_report >&2
+      exit 3
+    fi
+  else
+    echo "NOTE: 용량 상한 파일이 없어 세션 수를 검사하지 않았습니다 ($CAPACITY_LIB)." >&2
+  fi
 fi
 
 # ─── Spawn ────────────────────────────────────────────────────────────────
