@@ -43,6 +43,31 @@ function ownerDmChatId(db: Database): string | undefined {
   return row?.value || undefined;
 }
 
+/** 전원공지(all_hands) 시간당 발신자 상한. `off` = 상한 없음, 0 = 전원공지 전면 차단.
+ *  숫자가 아니거나 없으면 기본값을 쓴다 — ★오타가 "상한 없음" 으로 조용하게 번지지 않게 한다.★
+ *  상한을 끄려면 `off` 라고 적어야 하므로, 끄는 것은 항상 명시적이다. */
+export const ALL_HANDS_CAP_PER_HOUR_DEFAULT = 3;
+
+export function allHandsHourlyCap(
+  raw: string | undefined = process.env.BUS_ALL_HANDS_MAX_PER_HOUR,
+): number | null {
+  if (raw !== undefined && raw.trim().toLowerCase() === "off") return null;
+  const n = Number(raw);
+  if (raw === undefined || raw.trim() === "" || !Number.isInteger(n) || n < 0) {
+    return ALL_HANDS_CAP_PER_HOUR_DEFAULT;
+  }
+  return n;
+}
+
+/** 한도가 다시 림리는 까지 남은 초. `at` 은 UTC 문자열(`datetime('now')`)이라
+ *  ★Z 를 붙여 해석해야 한다★ — 안 붙이면 로컬로 읽혀 KST 에서 9시간 틀린다. */
+export function retryAfterSec(oldestAt: string | null, nowMs: number = Date.now()): number {
+  if (!oldestAt) return 0;
+  const startedMs = Date.parse(`${oldestAt.replace(" ", "T")}Z`);
+  if (!Number.isFinite(startedMs)) return 0;
+  return Math.max(0, Math.ceil((startedMs + 3_600_000 - nowMs) / 1000));
+}
+
 export function createInboxRoutes(deps: InboxRouteDeps): Hono {
   const r = new Hono();
 
@@ -193,6 +218,50 @@ export function createInboxRoutes(deps: InboxRouteDeps): Hono {
           error: "all_hands_sender_ineligible",
           detail: "전체공지는 정식·활성 팀원만 보낼 수 있습니다.",
         }, 403);
+      }
+      // ★시간당 상한★ — 자객 검사는 "보낼 수 있는가"만 보고 "얼마나 자주"를 보지 않는다.
+      //   전원공지 1건은 나머지 명부 전원을 깨워 한 턴을 소모시킨다. 상한이 없으면
+      //   1인이 짧은 사이에 반복해 명부 전원의 턴을 몇 배로 태울 수 있다.
+      //   실재: 전원공지 2건이 90초 안에 나가 각 6명을 깨웠다(머버 턴 12개).
+      //
+      // 세는 것은 새 상태가 아니라 이미 성공 건마다 단는 기록(`agent_broadcast_all_hands`)이다.
+      //   ★그래서 재시작·배효에도 창이 살아있고★, 마이그레이새이 필요 없다.
+      //   거부된 시도는 기록을 남기지 않으물 — 맞지 않았다면 한도를 소분하지 않는다.
+      const hourlyCap = allHandsHourlyCap();
+      if (hourlyCap !== null) {
+        const window = deps.db
+          .prepare(
+            `SELECT COUNT(*) AS n, MIN(at) AS oldest FROM (
+               SELECT at FROM audit_event
+               WHERE actor = ? AND action = 'agent_broadcast_all_hands'
+                 AND at > datetime('now', '-60 minutes')
+               ORDER BY at DESC LIMIT ?
+             )`,
+          )
+          .get(env.from_agent_id, Math.max(hourlyCap, 1)) as { n: number; oldest: string | null };
+        if (window.n >= hourlyCap) {
+          const detail = {
+            reason: env.all_hands,
+            sent_last_hour: window.n,
+            cap_per_hour: hourlyCap,
+            retry_after_sec: retryAfterSec(window.oldest),
+            error: "rate_limited",
+            identity_basis: "claimed_from_agent_id",
+          };
+          appendAudit(deps.db, env.from_agent_id, "agent_all_hands_blocked", null, detail);
+          appendAuditFile(env.from_agent_id, "agent_all_hands_blocked", null, detail);
+          return c.json({
+            error: "all_hands_rate_limited",
+            detail:
+              `전원공지는 시간당 ${hourlyCap}건입니다 — 지난 1시간 ${window.n}건으로 한도가 챠습니다. ` +
+              `${retryAfterSec(window.oldest)}초 뒤 다시 가능합니다. ` +
+              `급하지 않은 공지는 --all-hands 없이 --to broadcast 로 보내십시오(방에만 게시되고 아무도 안 깨웁니다). ` +
+              `한 사람에게만 필요하면 --to <이름> 을 쓰십시오.`,
+            cap_per_hour: hourlyCap,
+            sent_last_hour: window.n,
+            retry_after_sec: retryAfterSec(window.oldest),
+          }, 429);
+        }
       }
       allHandsEligibleRecipients = broadcastRecipientIds(roster, env.from_agent_id);
       env = { ...env, explicit_recipients: allHandsEligibleRecipients };

@@ -13,9 +13,9 @@
  *  ① 팀원 전체공지 = 정식·활성 자격 + `all_hands` 사유가 있어야 한다
  *  ② broadcast 에 대한 답은 broadcast 로 못 한다 (coordinator 라도) — 연쇄의 직접 고리
  */
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { createInboxRoutes } from "./inbox";
+import { ALL_HANDS_CAP_PER_HOUR_DEFAULT, allHandsHourlyCap, createInboxRoutes, retryAfterSec } from "./inbox";
 import { migrate } from "../db/migrate";
 import type { AgentRecord } from "../types";
 
@@ -200,5 +200,147 @@ describe("★all_hands 전체공지는 사유·발신자격·감사를 강제한
       eligible_recipient_count: 1,
       zero_reason: "registry_db_out_of_sync",
     });
+  });
+});
+
+/**
+ * ★전원공지 시간당 상한★
+ *
+ * 자격 검사는 "보낼 수 있는가"만 본다. "얼마나 자주"는 보지 않는다.
+ * 전원공지 1건은 명부 전원의 턴을 소모하므로, 상한이 없으면 1인이 짧은 사이에
+ * 반복해 전원의 턴을 몇 배로 태울 수 있다. 실측: 전원공지 2건이 90초 안에 나가
+ * 각 6명을 깨웠다(멤버 턴 12개).
+ *
+ * 세는 것은 새 상태가 아니라 성공 기록(`agent_broadcast_all_hands`)이다 —
+ * 재시작·배포에도 창이 유지되고 마이그레이션이 필요 없다.
+ */
+describe("★전원공지 시간당 상한★", () => {
+  const ENV_KEY = "BUS_ALL_HANDS_MAX_PER_HOUR";
+  let saved: string | undefined;
+
+  beforeEach(() => { saved = process.env[ENV_KEY]; });
+  afterEach(() => {
+    if (saved === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = saved;
+  });
+
+  // 본문을 매번 다르게 한다 — acceptInbound 의 60초 dedupe 가 같은 본문을 삼켜
+  // 상한이 아니라 dedupe 를 시험하게 되는 것을 막는다.
+  const blast = (h: ReturnType<typeof createInboxRoutes>, i: number) =>
+    send(h, { from_agent_id: "steve", all_hands: `공지 ${i}`, body: `전원 공지 본문 ${i}` });
+
+  it("상한까지는 통과하고 그 다음 1건을 429 로 막는다", async () => {
+    process.env[ENV_KEY] = "2";
+    const { h } = app();
+    expect((await blast(h, 1)).status).not.toBe(429);
+    expect((await blast(h, 2)).status).not.toBe(429);
+
+    const blocked = await blast(h, 3);
+    expect(blocked.status).toBe(429);
+    const body = (await blocked.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ error: "all_hands_rate_limited", cap_per_hour: 2, sent_last_hour: 2 });
+    // 언제 다시 되는지 알려줘야 한다 — 모르면 발신자가 계속 두드린다.
+    expect(body.retry_after_sec as number).toBeGreaterThan(0);
+    expect(body.retry_after_sec as number).toBeLessThanOrEqual(3600);
+  });
+
+  it("막힌 시도는 한도를 소모하지 않는다 — 성공 기록이 늘지 않는다", async () => {
+    process.env[ENV_KEY] = "1";
+    const { h, db } = app();
+    expect((await blast(h, 1)).status).not.toBe(429);
+    expect((await blast(h, 2)).status).toBe(429);
+    expect((await blast(h, 3)).status).toBe(429);
+
+    const sent = db.prepare(
+      `SELECT COUNT(*) AS n FROM audit_event WHERE action='agent_broadcast_all_hands'`,
+    ).get() as { n: number };
+    expect(sent.n).toBe(1);
+  });
+
+  it("차단을 사유와 함께 기록한다 — 사후에 누가 몇 건 쳤는지 판정할 수 있어야 한다", async () => {
+    process.env[ENV_KEY] = "1";
+    const { h, db } = app();
+    await blast(h, 1);
+    await blast(h, 2);
+    const row = db.prepare(
+      `SELECT actor, detail_json FROM audit_event WHERE action='agent_all_hands_blocked' ORDER BY id DESC LIMIT 1`,
+    ).get() as { actor: string; detail_json: string };
+    expect(row.actor).toBe("steve");
+    expect(JSON.parse(row.detail_json)).toMatchObject({
+      error: "rate_limited",
+      cap_per_hour: 1,
+      sent_last_hour: 1,
+      reason: "공지 2",
+    });
+  });
+
+  it("상한은 발신자별이다 — 한 사람이 채워도 다른 사람은 막히지 않는다", async () => {
+    process.env[ENV_KEY] = "1";
+    const { h } = app();
+    expect((await blast(h, 1)).status).not.toBe(429);
+    expect((await blast(h, 2)).status).toBe(429);
+    const other = await send(h, { from_agent_id: "bill", all_hands: "다른 발신자", body: "다른 발신자 본문" });
+    expect(other.status).not.toBe(429);
+  });
+
+  it("60분보다 오래된 기록은 세지 않는다 — 고정창이 아니라 흐르는 창이다", async () => {
+    process.env[ENV_KEY] = "1";
+    const { h, db } = app();
+    db.prepare(
+      `INSERT INTO audit_event (actor, action, target, detail_json, at)
+       VALUES ('steve','agent_broadcast_all_hands',NULL,'{}',datetime('now','-61 minutes'))`,
+    ).run();
+    expect((await blast(h, 1)).status).not.toBe(429);
+  });
+
+  it("off 면 상한을 걸지 않는다", async () => {
+    process.env[ENV_KEY] = "off";
+    const { h } = app();
+    for (let i = 1; i <= 4; i += 1) expect((await blast(h, i)).status).not.toBe(429);
+  });
+
+  it("0 이면 전원공지를 전면 차단한다 — off 와 다른 값이다", async () => {
+    process.env[ENV_KEY] = "0";
+    const { h } = app();
+    expect((await blast(h, 1)).status).toBe(429);
+  });
+});
+
+describe("allHandsHourlyCap — 설정값 해석", () => {
+  it("없으면 기본 상한을 쓴다", () => {
+    expect(allHandsHourlyCap(undefined)).toBe(ALL_HANDS_CAP_PER_HOUR_DEFAULT);
+  });
+
+  it("★오타는 '상한 없음' 으로 번지지 않는다★ — 숫자가 아니면 기본값으로 떨어진다", () => {
+    for (const bad of ["", " ", "abc", "3건", "-1", "2.5"]) {
+      expect(allHandsHourlyCap(bad)).toBe(ALL_HANDS_CAP_PER_HOUR_DEFAULT);
+    }
+  });
+
+  it("off 만 상한을 끈다 — 끄는 것은 항상 명시적이다", () => {
+    expect(allHandsHourlyCap("off")).toBeNull();
+    expect(allHandsHourlyCap("OFF")).toBeNull();
+  });
+
+  it("정수는 그대로 상한이 된다", () => {
+    expect(allHandsHourlyCap("0")).toBe(0);
+    expect(allHandsHourlyCap("7")).toBe(7);
+  });
+});
+
+describe("retryAfterSec — at 은 UTC 다", () => {
+  it("★Z 를 붙여 해석한다★ — 안 붙이면 KST 로 읽혀 9시간 틀린다", () => {
+    const now = Date.parse("2026-09-29T03:00:00Z");
+    // 30분 전에 창이 시작됐으면 30분(1800초) 남는다.
+    expect(retryAfterSec("2026-09-29 02:30:00", now)).toBe(1800);
+  });
+
+  it("창이 이미 지났으면 0 이다 (음수로 내려가지 않는다)", () => {
+    const now = Date.parse("2026-09-29T03:00:00Z");
+    expect(retryAfterSec("2026-09-29 01:00:00", now)).toBe(0);
+  });
+
+  it("기록이 없으면 0 이다", () => {
+    expect(retryAfterSec(null)).toBe(0);
   });
 });
